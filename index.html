@@ -22,44 +22,142 @@ function starSet(n){formStars=n;$('starRating').innerHTML=Array.from({length:7},
 function openPerson(id){editId=id||null;let p=db.people.find(x=>x.id===id)||{stars:4,role:'Les deux'};formStars=p.stars||4;let count=db.sessions.filter(s=>s.partner===id||(s.opponents||[]).includes(id)).length;modal(id?'Modifier le joueur':'Ajouter un joueur',`<form onsubmit="savePerson(event)">${field('Nom ou surnom','pName',p.name||'','text','required maxlength="80"')}${options('pRole',[['Les deux','Partenaire et adversaire'],['Partenaire','Partenaire'],['Adversaire','Adversaire']],p.role,'Rôle habituel')}<div class="field"><label>Niveau estimé · ${formStars}/7 étoiles</label><div class="stars" id="starRating"></div></div><div class="field"><label>Notes</label><textarea id="pNotes" placeholder="Style de jeu, points forts, club...">${esc(p.notes||'')}</textarea></div>${id?`<div class="detailblock">${count} séance${count>1?'s':''} ensemble ou face à face</div>`:''}<button class="fullbtn" type="submit">Enregistrer</button>${id?`<button class="danger" type="button" onclick="deleteEntry('people','${id}')">Supprimer ce joueur</button>`:''}</form>`);starSet(formStars)}function savePerson(e){e.preventDefault();let p={id:editId||uid(),name:$('pName').value.trim(),role:$('pRole').value,stars:formStars,notes:$('pNotes').value.trim()};if(!p.name)return;let i=db.people.findIndex(x=>x.id===p.id);if(i<0)db.people.push(p);else db.people[i]=p;save();closeModal();navigate('people')}
 function openGear(id){editId=id||null;let g=db.gear.find(x=>x.id===id)||{category:'Raquette'};modal(id?'Modifier le matériel':'Ajouter du matériel',`<form onsubmit="saveGear(event)">${field('Marque et modèle','gName',g.name||'','text','required maxlength="100"')}${options('gCategory',['Raquette','Chaussures','Sac','Vêtements','Accessoire','Autre'].map(x=>[x,x]),g.category,'Catégorie')}${field('Date d’achat (facultatif)','gDate',g.date||'','date')}${field('Prix d’achat (facultatif, €)','gPrice',g.price??'','number','min="0" step="0.01"')}<div class="field"><label>Notes / état</label><textarea id="gNotes" placeholder="Ex. Grip changé, raquette principale...">${esc(g.notes||'')}</textarea></div><button type="submit" class="fullbtn">Enregistrer</button>${id?`<button type="button" class="danger" onclick="deleteEntry('gear','${id}')">Supprimer cet équipement</button>`:''}</form>`)}function saveGear(e){e.preventDefault();let g={id:editId||uid(),name:$('gName').value.trim(),category:$('gCategory').value,date:$('gDate').value,price:$('gPrice').value===''?null:Number($('gPrice').value),notes:$('gNotes').value.trim()};if(!g.name)return;let i=db.gear.findIndex(x=>x.id===g.id);if(i<0)db.gear.push(g);else db.gear[i]=g;save();closeModal();navigate('gear')}
 function deleteEntry(type,id){if(!confirm('Supprimer définitivement cet élément ?'))return;db[type]=db[type].filter(x=>x.id!==id);if(cloudUser)queueDeletion(type,id);save();closeModal();render()}function exportData(){let blob=new Blob([JSON.stringify({app:'Padelaplace',version:1,exportedAt:new Date().toISOString(),...db},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`padelaplace-sauvegarde-${dateToday()}.json`;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}async function importData(ev){let f=ev.target.files?.[0];if(!f)return;try{let d=JSON.parse(await f.text());if(!['sessions','people','gear'].every(k=>Array.isArray(d[k])))throw Error('Format incorrect');if(!confirm('Remplacer les données actuellement stockées par cette sauvegarde ?'))return;db={sessions:d.sessions,people:d.people,gear:d.gear};save();navigate('home');alert('Sauvegarde restaurée.')}catch(e){alert('Fichier de sauvegarde invalide.')}finally{ev.target.value=''}}function resetData(){if(cloudUser){alert('Pour protéger les données synchronisées, la suppression globale est désactivée lorsque tu es connecté. Supprime les éléments individuellement.');return}if(confirm('Effacer toutes les séances, les joueurs et le matériel ? Cette action est irréversible.')){db={sessions:[],people:[],gear:[]};save();navigate('home')}}
-// Padelaplace 1.3 beta: auth + per-account offline queue.
+
+// Padelaplace 1.3 bêta — stockage Supabase dans public.user_data.
+// Le stockage historique padelaplace-v1 ne doit jamais être effacé.
 const SUPABASE_URL='https://blhgitcueyllhijajhov.supabase.co';
 const SUPABASE_KEY='sb_publishable_72NNhCqvROMFWkfAFCHSHQ_O8Gj8n0g';
-const TABLES={sessions:'padel_sessions',people:'padel_people',gear:'padel_gear'};
-let cloud=null,cloudUser=null,cloudBusy=false,cloudStatus='Hors connexion',cloudReady=false;
+let cloud=null,cloudUser=null,cloudBusy=false,cloudStatus='Non connecté';
+let cloudDirty=false,cloudTimer=null,cloudLoaded=false;
 const activeKey=()=>cloudUser?'padelaplace-account-'+cloudUser.id:KEY;
-const queueKey=()=>cloudUser?'padelaplace-queue-'+cloudUser.id:null;
+const dirtyKey=()=>cloudUser?'padelaplace-dirty-'+cloudUser.id:null;
 const validDb=d=>d&&['sessions','people','gear'].every(k=>Array.isArray(d[k]));
-function cloudSettings(){return `<div class="detailblock"><h3>☁️ Mon compte et synchronisation</h3><p class="settingscopy">${esc(cloudStatus)}. Chaque compte dispose de ses propres données. La version locale d'origine n'est jamais transférée automatiquement.</p>${cloudUser?`<p class="settingscopy">Connecté : <strong>${esc(cloudUser.email||'Compte')}</strong></p><button class="settingsbtn" onclick="syncCloud(true)">↻ Synchroniser maintenant</button><button class="settingsbtn" onclick="document.getElementById('importFile').click()">↙ Importer ma sauvegarde JSON dans ce compte</button><button class="settingsbtn" onclick="signOutCloud()">Se déconnecter</button>`:`<div class="field"><label for="authEmail">Adresse e-mail</label><input id="authEmail" type="email" autocomplete="email" placeholder="ton@email.fr"></div><div class="field"><label for="authPassword">Mot de passe (au moins 6 caractères)</label><input id="authPassword" type="password" autocomplete="current-password"></div><button class="settingsbtn" onclick="signInCloud(false)">Se connecter</button><button class="settingsbtn" onclick="signInCloud(true)">Créer un compte</button>`}</div>`}
-function pending(){try{return JSON.parse(localStorage.getItem(queueKey())||'{}')}catch(e){return {}}}
-function writePending(p){if(queueKey())localStorage.setItem(queueKey(),JSON.stringify(p))}
-function queueSnapshot(){if(!cloudUser)return;let p=pending();for(const type of Object.keys(TABLES)){p[type] ||= {};for(const item of db[type])if(item.id)p[type][item.id]={action:'upsert',item};}writePending(p);cloudStatus='Modifications locales en attente';if(navigator.onLine)syncCloud(false)}
-function queueDeletion(type,id){if(!cloudUser)return;let p=pending();p[type] ||= {};p[type][id]={action:'delete'};writePending(p)}
-function makeClient(){if(cloud)return cloud;if(!window.supabase?.createClient){cloudStatus='Bibliothèque Supabase indisponible : connexion Internet requise';return null}cloud=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});return cloud}
-async function signInCloud(signup){let client=makeClient();if(!client){render();return}let email=document.getElementById('authEmail')?.value.trim(),password=document.getElementById('authPassword')?.value;if(!email||!password){alert('Renseigne ton e-mail et ton mot de passe.');return}if(password.length<6){alert('Mot de passe trop court.');return}try{let {data,error}=signup?await client.auth.signUp({email,password}):await client.auth.signInWithPassword({email,password});if(error)throw error;if(data.session){await activateCloud(data.user);await syncCloud(true)}else{alert('Compte créé. Vérifie ton e-mail et confirme ton inscription avant de te connecter.')}render()}catch(e){alert('Connexion impossible : '+e.message)}}
-async function activateCloud(user){if(!user)return;cloudUser=user;db={sessions:[],people:[],gear:[]};load();cloudStatus='Connecté — synchronisation à vérifier';render()}
-async function signOutCloud(){if(!confirm('Se déconnecter ? Les données du compte restent enregistrées localement et sur le serveur si synchronisées.'))return;await cloud?.auth.signOut();cloudUser=null;db={sessions:[],people:[],gear:[]};load();cloudStatus='Hors connexion';render()}
-async function syncCloud(showMessage){if(!cloudUser||cloudBusy||!navigator.onLine)return;let client=makeClient();if(!client)return;cloudBusy=true;cloudStatus='Synchronisation en cours';try{
- let p=pending();for(const [type,table] of Object.entries(TABLES)){
-  let changes=p[type]||{};
-  for(const [id,change] of Object.entries(changes)){
-   let result=change.action==='delete'?await client.from(table).delete().eq('id',id).eq('user_id',cloudUser.id):await client.from(table).upsert({id,user_id:cloudUser.id,payload:change.item},{onConflict:'id'});
-   if(result.error)throw result.error;
-   delete changes[id];writePending(p);
+const hasData=d=>d&&['sessions','people','gear'].some(k=>(d[k]||[]).length>0);
+
+function cloudSettings(){
+ return `<div class="detailblock"><h3>☁️ Mon compte et sauvegarde cloud</h3>
+ <p class="settingscopy">${esc(cloudStatus)}. Chaque compte ne peut accéder qu'à ses propres données.</p>
+ ${cloudUser?`<p class="settingscopy">Connecté : <strong>${esc(cloudUser.email||'Compte')}</strong></p>
+ <button class="settingsbtn" onclick="syncCloud(true)">↻ Synchroniser maintenant</button>
+ <button class="settingsbtn" onclick="$('importFile').click()">↙ Importer ma sauvegarde JSON dans ce compte</button>
+ <button class="settingsbtn" onclick="signOutCloud()">Se déconnecter</button>`:
+ `<div class="field"><label for="authEmail">Adresse e-mail</label><input id="authEmail" type="email" autocomplete="email"></div>
+ <div class="field"><label for="authPassword">Mot de passe (6 caractères minimum)</label>
+ <input id="authPassword" type="password" autocomplete="current-password"></div>
+ <button class="settingsbtn" onclick="signInCloud(false)">Se connecter</button>
+ <button class="settingsbtn" onclick="signInCloud(true)">Créer un compte</button>`}</div>`;
+}
+
+function makeClient(){
+ if(cloud)return cloud;
+ if(!window.supabase?.createClient){cloudStatus='Supabase inaccessible : connexion Internet requise';return null}
+ cloud=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{
+  auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+ });
+ return cloud;
+}
+async function signInCloud(signup){
+ let client=makeClient();if(!client){render();return}
+ const email=$('authEmail')?.value.trim(),password=$('authPassword')?.value;
+ if(!email||!password||password.length<6){alert('Indique un e-mail et un mot de passe de 6 caractères minimum.');return}
+ try{
+  const {data,error}=signup?await client.auth.signUp({email,password}):
+    await client.auth.signInWithPassword({email,password});
+  if(error)throw error;
+  if(data.session?.user){await activateCloud(data.session.user);await syncCloud(true);}
+  else alert('Compte créé. Confirme ton adresse avec le lien reçu par e-mail puis connecte-toi.');
+ }catch(e){alert('Connexion impossible : '+e.message)}
+ if(page==='settings')render();
+}
+async function activateCloud(user){
+ if(!user)return;
+ cloudUser=user;cloudLoaded=false;
+ db={sessions:[],people:[],gear:[]};
+ load(); // uniquement le stockage de CE compte, jamais celui de la v1.2
+ cloudDirty=localStorage.getItem(dirtyKey())==='1';
+ cloudStatus='Compte connecté — récupération des données';
+ render();
+}
+function queueSnapshot(){
+ if(!cloudUser)return;
+ cloudDirty=true;
+ localStorage.setItem(dirtyKey(),'1');
+ cloudStatus='Sauvegarde cloud en attente';
+ clearTimeout(cloudTimer);
+ cloudTimer=setTimeout(()=>syncCloud(false),1100);
+}
+function queueDeletion(){/* La prochaine sauvegarde transmet le JSON complet, y compris les suppressions. */}
+async function signOutCloud(){
+ if(!confirm('Se déconnecter de ce compte ?'))return;
+ clearTimeout(cloudTimer);
+ if(cloudDirty){alert('Synchronise les modifications avant de te déconnecter.');return}
+ let {error}=await makeClient().auth.signOut();
+ if(error){alert(error.message);return}
+ cloudUser=null;cloudLoaded=false;db={sessions:[],people:[],gear:[]};
+ load();cloudStatus='Non connecté';render();
+}
+async function syncCloud(showMessage){
+ if(!cloudUser||cloudBusy)return;
+ if(!navigator.onLine){cloudStatus='Hors ligne : modifications conservées sur cet appareil';if(page==='settings')render();return}
+ const client=makeClient();if(!client)return;
+ cloudBusy=true;
+ try{
+  if(!cloudLoaded){
+   const {data:row,error}=await client.from('user_data').select('data')
+     .eq('user_id',cloudUser.id).maybeSingle();
+   if(error)throw error;
+   const remote=row?.data;
+   if(validDb(remote)&&!cloudDirty){
+    db={sessions:remote.sessions,people:remote.people,gear:remote.gear};
+    localStorage.setItem(activeKey(),JSON.stringify(db));
+   }else if(validDb(remote)&&cloudDirty){
+    // Conservons la copie modifiée hors connexion. Une opération explicite
+    // peut ensuite l'envoyer; ne jamais l'écraser silencieusement.
+    cloudStatus='Modifications locales en attente de synchronisation';
+   }else if(!row&&!hasData(db)){
+    cloudStatus='Compte vide : importe ta sauvegarde JSON dans les réglages';
+   }
+   cloudLoaded=true;
+  }
+  if(cloudDirty){
+   const snapshot=JSON.stringify(db);
+   const {error}=await client.from('user_data').upsert({
+    user_id:cloudUser.id,data:JSON.parse(snapshot),updated_at:new Date().toISOString()
+   },{onConflict:'user_id'});
+   if(error)throw error;
+   // Ne pas effacer une modification faite pendant l'envoi.
+   if(JSON.stringify(db)===snapshot){
+    cloudDirty=false;localStorage.removeItem(dirtyKey());
+   }
+  }
+  if(!cloudDirty)cloudStatus='Compte synchronisé';
+  if(showMessage)alert(cloudStatus);
+ }catch(e){
+  cloudStatus='Échec de sauvegarde : '+e.message;
+  if(showMessage)alert(cloudStatus);
+ }finally{
+  cloudBusy=false;
+  if(page==='settings')render();
+  if(cloudDirty&&navigator.onLine&&cloudLoaded) {
+   // Pas de boucle de relance automatique sur erreur réseau/permissions.
   }
  }
- let merged={sessions:[],people:[],gear:[]};for(const [type,table] of Object.entries(TABLES)){
-  let {data,error}=await client.from(table).select('id,payload').eq('user_id',cloudUser.id).limit(10000);
-  if(error)throw error;
-  let map=new Map((data||[]).filter(x=>x.payload&&typeof x.payload==='object').map(x=>[x.id,{...x.payload,id:x.id}]));
-  for(const item of db[type])if(item.id&&!map.has(item.id))map.set(item.id,item);
-  merged[type]=[...map.values()];
- }
- db=merged;localStorage.setItem(activeKey(),JSON.stringify(db));cloudStatus='Synchronisé';if(showMessage)alert('Synchronisation terminée.');
- }catch(e){cloudStatus='Échec de synchronisation : '+e.message;if(showMessage)alert(cloudStatus)}finally{cloudBusy=false;if(page==='settings')render()}}
-async function initializeCloud(){let client=makeClient();if(!client)return;try{let {data}=await client.auth.getSession();if(data?.session?.user){await activateCloud(data.session.user);await syncCloud(false)}}catch(e){cloudStatus='Compte non chargé : '+e.message}client.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_OUT'&&cloudUser){cloudUser=null;db={sessions:[],people:[],gear:[]};load();render()}})}
+}
+async function initializeCloud(){
+ const client=makeClient();if(!client)return;
+ try{
+  const {data,error}=await client.auth.getSession();if(error)throw error;
+  if(data.session?.user){await activateCloud(data.session.user);await syncCloud(false)}
+ }catch(e){cloudStatus='Échec chargement compte : '+e.message}
+ client.auth.onAuthStateChange((event)=>{
+  if(event==='SIGNED_OUT'&&cloudUser){
+   cloudUser=null;cloudLoaded=false;db={sessions:[],people:[],gear:[]};
+   load();cloudStatus='Non connecté';render();
+  }
+ });
+}
 window.addEventListener('online',()=>{if(cloudUser)syncCloud(false)});
-window.addEventListener('focus',()=>{if(cloudUser)syncCloud(false)});
+window.addEventListener('focus',()=>{if(cloudUser&&cloudDirty)syncCloud(false)});
 
-load();render();initializeCloud();if('serviceWorker'in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
+load();render();initializeCloud();
 </script></body></html>
